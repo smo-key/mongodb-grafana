@@ -411,12 +411,8 @@ function getTimeseriesResults(docs, bucketBoundaries)
   // sort docs
   docs = _.sortBy(docs, "ts");
 
-  console.log("Docs", docs);
-
   var maxTime = bucketBoundaries[bucketBoundaries.length - 1];
   var minTime = bucketBoundaries[0];
-
-  console.log("Bounds", minTime, maxTime);
 
   // iterate docs
   for (var doc of docs) {
@@ -436,12 +432,7 @@ function getTimeseriesResults(docs, bucketBoundaries)
     // place the doc in a bucket
     var docTime = doc.ts.getTime();
     var bucketIndex = Math.floor((docTime - minTime) / (maxTime - minTime) * bucketBoundaries.length);
-    console.log("Adding to index", bucketIndex, docTime)
     results[key].datapoints[bucketIndex][0] += doc.value;
-  }
-
-  for (var key of Object.keys(results)) {
-    console.log("Results", key, results[key])
   }
 
   return results
