@@ -1,0 +1,9 @@
+.vscode
+debugging
+dist
+examples
+node_modules
+spec
+src
+
+*.log

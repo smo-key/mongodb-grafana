@@ -4,11 +4,15 @@ var _ = require('lodash');
 var app = express();
 const MongoClient = require('mongodb').MongoClient;
 const assert = require('assert');
-var config = require('config');
 var Stopwatch = require("statman-stopwatch");
 var moment = require('moment')
 
 app.use(bodyParser.json());
+
+const SERVER_PORT = parseInt(process.env.MONGO_PROXY_SERVER_PORT || '3000', 10);
+const LOG_REQUESTS = process.env.LOG_REQUESTS === 'true';
+const LOG_QUERIES = process.env.LOG_QUERIES === 'true';
+const LOG_TIMINGS = process.env.LOG_TIMINGS === 'true';
 
 // Called by test
 app.all('/', function(req, res, next) 
@@ -127,10 +131,15 @@ app.all('/query', function(req, res, next)
     logRequest(req.body, "/query")
     setCORSHeaders(res);
 
+    var bucketBoundaries = getBucketBoundaries(req.body.range.from, req.body.range.to, req.body.intervalMs);
+
     // Parse query string in target
     substitutions = { "$from" : new Date(req.body.range.from),
                       "$to" : new Date(req.body.range.to),
-                      "$dateBucketCount" : getBucketCount(req.body.range.from, req.body.range.to, req.body.intervalMs)
+                      "$dateBucketCount": bucketBoundaries.length - 1,
+                      "$dateBuckets": bucketBoundaries.map((boundary) => {
+                        return new Date(boundary)
+                      })
                      }
 
     // Generate an id to track requests
@@ -156,11 +165,15 @@ app.all('/query', function(req, res, next)
         queryStates.push( { pending : true } )
 
         // Run the query
-        runAggregateQuery( requestId, queryId, req.body, queryArgs, res, next)
+        runAggregateQuery(requestId, queryId, req.body, queryArgs, bucketBoundaries, res, next)
       }
     }
   }
 );
+
+app.get("/status", function(req, res) {
+  res.send("OK");
+});
 
 app.use(function(error, req, res, next) 
 {
@@ -169,12 +182,9 @@ app.use(function(error, req, res, next)
   res.status(500).json({ message: error.message });
 });
 
-// Get config from server/default.json
-var serverConfig = config.get('server');
+app.listen(SERVER_PORT);
 
-app.listen(serverConfig.port);
-
-console.log("Server is listening on port " + serverConfig.port);
+console.log("Server is listening on port " + SERVER_PORT);
 
 function setCORSHeaders(res) 
 {
@@ -286,7 +296,7 @@ function parseQuery(query, substitutions)
 // Run an aggregate query. Must return documents of the form
 // { value : 0.34334, ts : <epoch time in seconds> }
 
-function runAggregateQuery( requestId, queryId, body, queryArgs, res, next )
+function runAggregateQuery( requestId, queryId, body, queryArgs, bucketBoundaries, res, next )
 {
   MongoClient.connect(body.db.url, function(err, client) 
   {
@@ -317,7 +327,7 @@ function runAggregateQuery( requestId, queryId, body, queryArgs, res, next )
               var results = {}
               if ( queryArgs.type == 'timeserie' )
               {
-                results = getTimeseriesResults(docs)
+                results = getTimeseriesResults(docs, bucketBoundaries)
               }
               else
               {
@@ -394,26 +404,46 @@ function getTableResults(docs)
   return results
 }
 
-function getTimeseriesResults(docs)
+function getTimeseriesResults(docs, bucketBoundaries)
 {
-  var results = {}
-  for ( var i = 0; i < docs.length; i++)
-  {
-    var doc = docs[i]
-    var tg = doc.name
-    var dp = null
-    if (tg in results)
-    {
-      dp = results[tg]
+  var results = { };
+
+  // sort docs
+  docs = _.sortBy(docs, "ts");
+
+  console.log("Docs", docs);
+
+  var maxTime = bucketBoundaries[bucketBoundaries.length - 1];
+  var minTime = bucketBoundaries[0];
+
+  console.log("Bounds", minTime, maxTime);
+
+  // iterate docs
+  for (var doc of docs) {
+    // get doc
+    var key = doc.name;
+
+    // create doc result key if not present
+    if (!results[key]) {
+      results[key] = { 'target': key, 'datapoints': [] };
+
+      // generate buckets
+      for (var i = 0; i < bucketBoundaries.length - 1; i++) {
+        results[key].datapoints.push([0, bucketBoundaries[i]])
+      }
     }
-    else
-    {
-      dp = { 'target' : tg, 'datapoints' : [] }
-      results[tg] = dp
-    }
-    
-    results[tg].datapoints.push([doc['value'], doc['ts'].getTime()])
+
+    // place the doc in a bucket
+    var docTime = doc.ts.getTime();
+    var bucketIndex = Math.floor((docTime - minTime) / (maxTime - minTime) * bucketBoundaries.length);
+    console.log("Adding to index", bucketIndex, docTime)
+    results[key].datapoints[bucketIndex][0] += doc.value;
   }
+
+  for (var key of Object.keys(results)) {
+    console.log("Results", key, results[key])
+  }
+
   return results
 }
 
@@ -469,7 +499,7 @@ function doTemplateQuery(requestId, queryArgs, db, res, next)
 
 function logRequest(body, type)
 {
-  if (serverConfig.logRequests)
+  if (LOG_REQUESTS)
   {
     console.log("REQUEST: " + type + ":\n" + JSON.stringify(body,null,2))
   }
@@ -477,7 +507,7 @@ function logRequest(body, type)
 
 function logQuery(query, options)
 {
-  if (serverConfig.logQueries)
+  if (LOG_QUERIES)
   {
     console.log("Query:")
     console.log(JSON.stringify(query,null,2))
@@ -491,7 +521,7 @@ function logQuery(query, options)
 
 function logTiming(body, elapsedTimeMs)
 {
-  if (serverConfig.logTimings)
+  if (LOG_TIMINGS)
   {
     var range = new Date(body.range.to) - new Date(body.range.from)
     var diff = moment.duration(range)
@@ -512,17 +542,16 @@ function intervalCount(range, intervalString, intervalMs)
   return output
 }
 
-function getBucketCount(from, to, intervalMs)
-{
+function getBucketBoundaries(from, to, intervalMs) {
   var boundaries = []
   var current = new Date(from).getTime()
   var toMs = new Date(to).getTime()
-  var count = 0
-  while ( current < toMs )
-  {
-    current += intervalMs
-    count++
-  }
 
-  return count
+  while(current < toMs) {
+    boundaries.push(current)
+    current += intervalMs;
+  }
+  boundaries.push(current);
+
+  return boundaries;
 }
